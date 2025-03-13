@@ -1,45 +1,70 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import MovingCircle from "./components/MovingCircle";
 import ChatInput from "./components/ChatInput";
 import ChatBubble from "./components/ChatBubble";
-import { askQuestion } from "./services/apiService";
+import { askQuestion, greetUser } from "./services/apiService";
+import { useAuthState } from 'react-firebase-hooks/auth';
+import { auth } from './config/firebase';
+import { updateUserLastActive } from './services/userService';
+import Login from './components/Login';
 
 function App() {
+  const [user] = useAuthState(auth);
   const [messages, setMessages] = useState([]);
   const [currentResponse, setCurrentResponse] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const [showMessage, setShowMessage] = useState(false);
+  
 
-  const handleSend = async (question) => {
+  useEffect(() => {
+    if (user) {
+      updateUserLastActive(user.uid);
+      fetchGreeting();
+    }
+  }, [user]);
+
+  const fetchGreeting = async () => {
+    setIsLoading(true);
     try {
-      if (!question.trim()) return;
-      
-      setIsLoading(true);
-      setMessages(prev => [...prev, { text: question, isAnswer: false }]);
-
-      const response = await askQuestion(question);
-      const answer = typeof response === 'object' ? response.answer : response;
-      
-      setCurrentResponse(answer);
-      setIsSpeaking(true);
-
-      // Đợi 5 giây trước khi hiển thị tin nhắn
-      setTimeout(() => {
-        setIsSpeaking(false);
-        setCurrentResponse("");
-        setShowMessage(true);
-        setMessages(prev => [...prev, { text: answer, isAnswer: true }]);
-      }, 5000);
-
+      const greeting = await greetUser();
+      console.log("🔥 Debug: Greeting response =", greeting); // Kiểm tra phản hồi từ API
+      setMessages([{ text: greeting.response, isAnswer: true }]);
     } catch (error) {
-      setMessages(prev => [...prev, { text: "Vui lòng thử lại sau", isAnswer: true }]);
+      console.error("Lỗi khi lấy lời chào:", error);
+      setMessages([{ text: "Lỗi khi lấy lời chào, vui lòng thử lại.", isAnswer: true }]);
     } finally {
       setIsLoading(false);
     }
   };
 
-  
+  const handleSend = async (question) => {
+    if (!question.trim()) return;
+    setIsLoading(true);
+    setMessages(prev => [...prev, { text: question, isAnswer: false }]);
+
+    try {
+      const response = await askQuestion(question);
+      const answer = response?.answer || "Không nhận được phản hồi từ server.";
+      setCurrentResponse(answer);
+      setIsSpeaking(true);
+
+      setTimeout(() => {
+        setIsSpeaking(false);
+        setCurrentResponse("");
+        setMessages(prev => [...prev, { text: answer, isAnswer: true }]);
+      }, 5000);
+
+    } catch (error) {
+      console.error("Lỗi khi gửi câu hỏi:", error);
+      setMessages(prev => [...prev, { text: "Lỗi kết nối, vui lòng thử lại.", isAnswer: true }]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  if (!user) {
+    return <Login />;
+  }
 
   return (
     <div style={{ 
@@ -50,6 +75,15 @@ function App() {
       WebkitFontSmoothing: 'antialiased',
       MozOsxFontSmoothing: 'grayscale'
     }}>
+      <div style={{
+        position: 'absolute',
+        top: 10,
+        right: 10,
+        zIndex: 1000
+      }}>
+        <button onClick={() => auth.signOut()}>Đăng xuất</button>
+      </div>
+      {isLoading && <div className="loading-indicator">Đang tải...</div>}
       <MovingCircle 
       response={currentResponse} 
       isSpeaking={isSpeaking}

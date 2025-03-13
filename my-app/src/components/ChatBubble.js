@@ -1,12 +1,11 @@
 import React from "react";
 
 const ChatBubble = ({ text, isAnswer }) => {
-  // Kiểm tra nếu text là object
-  const message = typeof text === 'object' ? text.answer : text;
-  
+  let message = typeof text === 'object' ? (text.answer || text.error || "Lỗi xảy ra, vui lòng thử lại!") : text;
+
   const defaultStyle = {
     maxWidth: "60%",
-    margin: isAnswer ? "10px auto 10px 0" : "10px 0 10px auto",
+    margin: isAnswer ? "10px auto 10px 0" : "10px 0 10px auto", 
     padding: "10px",
     borderRadius: "10px",
     backgroundColor: isAnswer ? "#E0E0E0" : "#FFD700",
@@ -23,6 +22,5 @@ const ChatBubble = ({ text, isAnswer }) => {
     </div>
   );
 };
-
 
 export default ChatBubble;
