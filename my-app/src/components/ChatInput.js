@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 
-const ChatInput = ({ onSend, disabled }) => {
+const ChatInput = ({ onSend, disabled, placeholder, mode }) => {
   const [question, setQuestion] = useState("");
 
   const handleSend = () => {
@@ -15,11 +15,30 @@ const ChatInput = ({ onSend, disabled }) => {
     }
   };
 
+  // Xác định text nổi dựa trên mode
+  const floatingText = mode === "teach" ? "Teach me about this:" : mode === "feedback" ? "Feedback:" : null;
+
   return (
     <div style={{ display: "flex", gap: "10px" }}>
+      {floatingText && (
+        <span
+          style={{
+            position: "absolute",
+            top: "-20px",
+            left: "10px",
+            fontSize: "14px",
+            fontWeight: "bold",
+            color: "#333",
+            backgroundColor: "#fff",
+            padding: "0 5px",
+          }}
+        >
+          {floatingText}
+        </span>
+      )}
       <input
         type="text"
-        placeholder="Nhập câu hỏi..."
+        placeholder={placeholder || "Nhập câu hỏi..."}
         value={question}
         onChange={(e) => setQuestion(e.target.value)}
         onKeyPress={handleKeyPress}

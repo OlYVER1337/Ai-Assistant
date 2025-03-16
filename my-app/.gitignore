@@ -21,3 +21,9 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# File tạm và nhạy cảm
+*.pyc
+__pycache__/
+*.sqlite
+*.json

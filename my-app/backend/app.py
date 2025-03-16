@@ -2,14 +2,9 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, auth
-from main import (
-    dynamic_respond, handle_system_command, handle_open_application,
-    handle_play_music, handle_check_weather, handle_set_appointment,
-    check_appointment_reminders, personalize_response, greet_user, WEATHERAPI_API_KEY,
-    process_negative_feedback, add_learned_responses, generate_flexible_response,
-    update_user_profile, learn_new_knowledge, update_reward_score
-)
+from main import dynamic_respond, greet_user, WEATHERAPI_API_KEY, get_user_profile, add_learned_responses, generate_flexible_response, log_interaction, personalize_response, process_negative_feedback
 import logging
+import sqlite3
 
 app = Flask(__name__)
 CORS(app, supports_credentials=True)
@@ -36,195 +31,103 @@ def verify_firebase_token():
         token = auth_header.split(' ')[1]
         decoded_token = auth.verify_id_token(token)
         return decoded_token
-    except Exception as e:
+    except firebase_admin.exceptions.InvalidArgumentError as e:
         print(f"Lỗi xác thực Firebase: {e}")
+        return None
+    except ValueError as e:
+        if "Token used too early" in str(e):
+            print("⚠️ Token bị từ chối do lệch thời gian. Thử lại sau 1 giây...")
+            time.sleep(1)  # Đợi 1 giây rồi thử lại
+            try:
+                decoded_token = auth.verify_id_token(token)
+                return decoded_token
+            except Exception:
+                return None
         return None
 
 @app.route('/ask', methods=['POST'])
 def ask_question():
-    """Xử lý câu hỏi của người dùng."""
-    try:
-        user = verify_firebase_token()
-        if not user:
-            return jsonify({"error": "Unauthorized", "status": "error"}), 401
+    user = verify_firebase_token()
+    if not user:
+        return jsonify({"error": "Unauthorized", "status": "error"}), 401
 
-        data = request.get_json(force=True)
-        question = data.get('question', '').strip()
-        
-        if not question:
-            return jsonify({"error": "Câu hỏi không được để trống", "status": "error"}), 400
-        
-        logging.debug(f"Received question: {question}")
-        answer = dynamic_respond(question)
-        logging.debug(f"Generated answer: {answer}")
-        return jsonify({"answer": answer, "status": "success"})
-    except Exception as e:
-        logging.error(f"Error in /ask: {e}")
-        return jsonify({"error": str(e), "status": "error"}), 500
+    data = request.get_json(force=True)
+    question = data.get('question', '').strip()
+    is_teaching = data.get('is_teaching', False)
+    teach_response = data.get('teach_response', '')
 
-@app.route('/command', methods=['POST'])
-def execute_command():
-    """Xử lý lệnh hệ thống từ người dùng."""
-    try:
-        user = verify_firebase_token()
-        if not user:
-            return jsonify({"error": "Unauthorized", "status": "error"}), 401
+    if not question:
+        return jsonify({"error": "Câu hỏi không được để trống", "status": "error"}), 400
 
-        data = request.get_json(force=True)
-        command = data.get('command', '').strip()
-        response = handle_system_command(command)
-        return jsonify({"response": response, "status": "success"})
-    except Exception as e:
-        return jsonify({"error": str(e), "status": "error"}), 500
-
-@app.route('/open_app', methods=['POST'])
-def open_application():
-    """Mở ứng dụng theo yêu cầu của người dùng."""
-    try:
-        user = verify_firebase_token()
-        if not user:
-            return jsonify({"error": "Unauthorized", "status": "error"}), 401
-
-        data = request.get_json(force=True)
-        app_name = data.get('app_name', '').strip()
-        response = handle_open_application(app_name)
-        return jsonify({"response": response, "status": "success"})
-    except Exception as e:
-        return jsonify({"error": str(e), "status": "error"}), 500
-
-@app.route('/play_music', methods=['POST'])
-def play_music():
-    """Phát nhạc theo yêu cầu của người dùng."""
-    try:
-        user = verify_firebase_token()
-        if not user:
-            return jsonify({"error": "Unauthorized", "status": "error"}), 401
-
-        data = request.get_json(force=True)
-        song_request = data.get('song', '').strip()
-        response = handle_play_music(song_request)
-        return jsonify({"response": response, "status": "success"})
-    except Exception as e:
-        return jsonify({"error": str(e), "status": "error"}), 500
-
-@app.route('/weather', methods=['POST'])
-def check_weather():
-    """Kiểm tra thời tiết theo yêu cầu của người dùng."""
-    try:
-        user = verify_firebase_token()
-        if not user:
-            return jsonify({"error": "Unauthorized", "status": "error"}), 401
-
-        data = request.get_json(force=True)
-        location = data.get('location', '').strip()
-        response = handle_check_weather(location, WEATHERAPI_API_KEY)
-        return jsonify({"response": response, "status": "success"})
-    except Exception as e:
-        return jsonify({"error": str(e), "status": "error"}), 500
-
-@app.route('/set_appointment', methods=['POST'])
-def set_appointment():
-    """Đặt lịch hẹn theo yêu cầu của người dùng."""
-    try:
-        user = verify_firebase_token()
-        if not user:
-            return jsonify({"error": "Unauthorized", "status": "error"}), 401
-
-        data = request.get_json(force=True)
-        appointment_request = data.get('appointment', '').strip()
-        response = handle_set_appointment(appointment_request)
-        return jsonify({"response": response, "status": "success"})
-    except Exception as e:
-        return jsonify({"error": str(e), "status": "error"}), 500
-
-@app.route('/reminders', methods=['GET'])
-def get_reminders():
-    """Lấy danh sách nhắc nhở lịch hẹn."""
-    try:
-        user = verify_firebase_token()
-        if not user:
-            return jsonify({"error": "Unauthorized", "status": "error"}), 401
-
-        response = check_appointment_reminders()
-        return jsonify({"response": response, "status": "success"})
-    except Exception as e:
-        return jsonify({"error": str(e), "status": "error"}), 500
+    logging.debug(f"📩 Received question: {question}, is_teaching: {is_teaching}")
+    response = dynamic_respond(question, user.get("uid"), is_teaching, teach_response)
+    logging.debug(f"🤖 AI's Response: {response}")
+    return jsonify(response)
 
 @app.route('/greet', methods=['POST'])
 def greet():
-    try:
-        user = verify_firebase_token()
-        if not user:
-            return jsonify({"error": "Unauthorized", "status": "error"}), 401
+    user = verify_firebase_token()
+    if not user:
+        return jsonify({"error": "Unauthorized", "status": "error"}), 401
 
-        uid = user.get("uid")  # 🔥 Lấy UID từ Firebase
+    data = request.get_json() or {}
+    username = data.get('username')
+    location = data.get('location')
+    response = greet_user(user.get("uid"), username, location)
+    return jsonify({"response": response.get("message", response.get("error")), "status": "success" if "message" in response else "error"})
 
-        data = request.get_json(force=True) or {}
-        username = data.get('username', '').strip()
-        location = data.get('location', '').strip()
-
-        # Gọi greet_user với UID
-        response = greet_user(uid=uid, username=username, location=location)  # ✅ Truyền uid vào
-
-        # Nếu thiếu username, yêu cầu frontend nhập
-        if response.get("error") == "missing_username":
-            return jsonify(response), 400  # HTTP 400: Bad Request
-
-        # Nếu thiếu location, yêu cầu frontend nhập
-        if response.get("error") == "missing_location":
-            return jsonify(response), 400
-
-        return jsonify({"response": response["message"], "status": "success"})
-    except Exception as e:
-        print(f"🔥 Lỗi trong API /greet: {e}")
-        return jsonify({"error": str(e), "status": "error"}), 500
+@app.route('/logout', methods=['POST'])
+def logout():
+    user = verify_firebase_token()
+    if not user:
+        return jsonify({"error": "Unauthorized", "status": "error"}), 401
+    return jsonify({"status": "success", "message": "Đăng xuất thành công"})
 
 
-
-@app.route('/provide_feedback', methods=['POST'])
-def provide_feedback():
-    data = request.get_json()
-    feedback = data.get('feedback', '').strip()
-    if feedback:
-        add_learned_responses('feedback', feedback)
-        new_answer = generate_flexible_response(feedback)
-        update_reward_score(5)
-        return jsonify({'message': f'Thank you for your feedback. Here is the updated answer: {new_answer}'}), 200
-    else:
-        update_reward_score(-5)
-        return jsonify({'message': 'No new information provided.'}), 400
-
-@app.route('/teach_ai', methods=['POST'])
+@app.route('/teach', methods=['POST'])
 def teach_ai():
-    data = request.get_json()
-    query = data.get('query', '').strip()
-    user_input = data.get('user_input', '').strip()
-    if user_input:
-        add_learned_responses(query, user_input)
-        return jsonify({'message': generate_flexible_response(user_input)}), 200
-    else:
-        return jsonify({'message': f'Thanks, I have learned about {query}.'}), 200
+    user = verify_firebase_token()
+    if not user:
+        return jsonify({"error": "Unauthorized", "status": "error"}), 401
 
-@app.route('/set_user_info', methods=['POST'])
-def set_user_info():
     data = request.get_json()
-    username = data.get('username', '').strip()
-    location = data.get('location', '').strip()
-    if username and location:
-        update_user_profile(username=username, location=location)
-        return jsonify({'message': 'User information updated successfully.'}), 200
-    else:
-        return jsonify({'message': 'Invalid user information.'}), 400
+    original_query = data.get('original_query')
+    teach_response = data.get('teach_response')
+    uid = user.get("uid")
+    username = get_user_profile(uid).get("username", "User") if uid else "User"
 
-@app.route('/user_input', methods=['POST'])
-def user_input():
+    if not original_query or not teach_response:
+        return jsonify({"error": "Missing original_query or teach_response", "status": "error"}), 400
+
+    add_learned_responses(original_query, teach_response)
+    updated_response = generate_flexible_response(teach_response)
+    log_interaction(original_query, updated_response)  # Ghi lại tương tác
+    return jsonify({
+        "answer": f"Thanks for teaching me, {username}! Here's the updated response: {updated_response}",
+        "status": "success"
+    })
+
+@app.route('/feedback', methods=['POST'])
+def send_feedback():
+    user = verify_firebase_token()
+    if not user:
+        return jsonify({"error": "Unauthorized", "status": "error"}), 401
+
     data = request.get_json()
-    user_input = data.get('user_input', '').strip()
-    if user_input:
-        # Process user input here
-        return jsonify({'message': 'User input processed.'}), 200
-    else:
-        return jsonify({'message': 'No input provided.'}), 400
+    original_query = data.get('original_query')
+    feedback = data.get('feedback')
+    uid = user.get("uid")
+    username = get_user_profile(uid).get("username", "User") if uid else "User"
+
+    if not original_query or not feedback:
+        return jsonify({"error": "Missing original_query or feedback", "status": "error"}), 400
+
+    response = process_negative_feedback(original_query, feedback)
+    log_interaction(original_query, response)
+    return jsonify({
+        "answer": response,
+        "status": "success"
+    })
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000, host='0.0.0.0')

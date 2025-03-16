@@ -18,6 +18,7 @@ async function getAuthToken() {
   }
 }
 
+
 async function apiRequest(endpoint, method, body) {
   const token = await getAuthToken();
   if (!token) return { error: "Không thể xác thực người dùng!" };
@@ -35,67 +36,85 @@ async function apiRequest(endpoint, method, body) {
     return response.data;
   } catch (error) {
     if (error.response) {
-      console.error(`Lỗi server: ${error.response.status}`, error.response.data);
       return { error: error.response.data.error || `Lỗi server: ${error.response.status}` };
-    } else if (error.request) {
-      console.error("Không thể kết nối đến server!", error.request);
-      return { error: "Không thể kết nối đến server!" };
-    } else {
-      console.error("Lỗi không xác định:", error.message);
-      return { error: "Lỗi không xác định!" };
     }
+    return { error: "Không thể kết nối đến server!" };
   }
 }
 
-export async function askQuestion(question) {
-  return apiRequest('/ask', 'POST', { question });
-}
+export async function askQuestion(question, isTeaching = false, teachResponse = '') {
+  try {
+    console.log("🔥 Gửi câu hỏi:", question, "isTeaching:", isTeaching);
+    const response = await apiRequest('/ask', 'POST', { 
+      question, 
+      is_teaching: isTeaching, 
+      teach_response: teachResponse 
+    });
+    console.log("🔥 API Response =", response);
 
-export async function executeCommand(command) {
-  return apiRequest('/command', 'POST', { command });
-}
-
-export async function openApp(app_name) {
-  return apiRequest('/open_app', 'POST', { app_name });
-}
-
-export async function playMusic(song) {
-  return apiRequest('/play_music', 'POST', { song });
-}
-
-export async function checkWeather(location) {
-  return apiRequest('/weather', 'POST', { location });
-}
-
-export async function setAppointment(appointment) {
-  return apiRequest('/set_appointment', 'POST', { appointment });
-}
-
-export async function getReminders() {
-  return apiRequest('/reminders', 'GET', null);
+    if (!response || !response.answer) {
+      return { response: "Không nhận được phản hồi hợp lệ từ server.", status: "error" };
+    }
+    return { response: response.answer, status: response.status || "success", query: response.query };
+  } catch (error) {
+    console.error("❌ API Error:", error);
+    return { response: "Không thể kết nối đến server. Hãy thử lại sau.", status: "error" };
+  }
 }
 
 export async function greetUser() {
-  let response = await apiRequest('/greet', 'POST', {});
-
-  // Trường hợp 1: Nếu thiếu tên, yêu cầu nhập
+  const response = await apiRequest('/greet', 'POST', {});
   if (response.error === "missing_username") {
     const username = prompt("Nhập tên của bạn:");
-    if (!username) return { error: "Bạn cần nhập tên để tiếp tục!" };
-
-    // Gửi lại API với username mới
-    response = await apiRequest('/greet', 'POST', { username });
+    if (!username) return { response: "Bạn cần nhập tên để tiếp tục!", status: "error" };
+    return await apiRequest('/greet', 'POST', { username });
   }
-
-  // Trường hợp 2: Nếu thiếu location, yêu cầu nhập
   if (response.error === "missing_location") {
     const location = prompt("Nhập vị trí của bạn:");
-    if (!location) return { error: "Bạn cần nhập vị trí để tiếp tục!" };
-
-    // Gửi lại API với location mới
-    response = await apiRequest('/greet', 'POST', { username: response.username, location });
+    if (!location) return { response: "Bạn cần nhập vị trí để tiếp tục!", status: "error" };
+    return await apiRequest('/greet', 'POST', { username: response.username, location });
   }
-
   return response;
+}
+
+export async function logout() {
+  const response = await apiRequest('/logout', 'POST', {});
+  return response;
+}
+
+export async function teachAI(originalQuery, teachResponse) {
+  try {
+    console.log("🔥 Gửi dạy AI:", originalQuery, teachResponse);
+    const response = await apiRequest('/teach', 'POST', { 
+      original_query: originalQuery, 
+      teach_response: teachResponse 
+    });
+    console.log("🔥 Teach API Response =", response);
+    if (!response || response.error) {
+      return { response: response.error || "Không thể dạy AI.", status: "error" };
+    }
+    return { response: response.answer, status: "success" };
+  } catch (error) {
+    console.error("❌ Teach API Error:", error);
+    return { response: "Không thể kết nối đến server. Hãy thử lại sau.", status: "error" };
+  }
+}
+
+export async function sendFeedback(originalQuery, feedback) {
+  try {
+    console.log("🔥 Gửi feedback:", originalQuery, feedback);
+    const response = await apiRequest('/feedback', 'POST', { 
+      original_query: originalQuery, 
+      feedback: feedback 
+    });
+    console.log("🔥 Feedback API Response =", response);
+    if (!response || response.error) {
+      return { response: response.error || "Không thể gửi feedback.", status: "error" };
+    }
+    return { response: response.answer, status: "success" };
+  } catch (error) {
+    console.error("❌ Feedback API Error:", error);
+    return { response: "Không thể kết nối đến server. Hãy thử lại sau.", status: "error" };
+  }
 }
 

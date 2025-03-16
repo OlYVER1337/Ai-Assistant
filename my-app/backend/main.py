@@ -4,7 +4,7 @@ import os, re, random, sqlite3, webbrowser, subprocess, requests
 import requests_cache  # Thư viện cache cho requests
 import screen_brightness_control as sbc
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-from ctypes import cast, POINTER
+from ctypes import cast, POINTER, windll
 from comtypes import CLSCTX_ALL
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -16,12 +16,14 @@ from urllib3.util.retry import Retry
 import spacy
 from dateutil import parser  # Dùng để parse chuỗi thời gian
 
+
 # Tải mô hình spaCy (cho tiếng Anh)
 nlp = spacy.load("en_core_web_sm")
 
 # -----------------------------------------------------------------------------
 # KHỞI TẠO CƠ SỞ DỮ LIỆU: learned_knowledge, interactions, user_profile, song_usage, app_usage
 # -----------------------------------------------------------------------------
+
 conn = sqlite3.connect('knowledge.db', check_same_thread=False)
 cursor = conn.cursor()
 
@@ -83,7 +85,10 @@ conn.commit()
 # -----------------------------------------------------------------------------
 # QUẢN LÝ HỒ SƠ NGƯỜI DÙNG & HỆ THỐNG THƯỞNG – PHẠT
 # -----------------------------------------------------------------------------
-def get_user_profile(uid):
+def get_user_profile(uid=None):
+    if not uid:
+        return None  # ✅ Trả về None nếu UID không hợp lệ
+
     conn = sqlite3.connect('knowledge.db')
     cursor = conn.cursor()
 
@@ -99,6 +104,7 @@ def get_user_profile(uid):
             "score": row[3] or 0
         }
     return None  # Không có user này
+
 
 
 def update_user_profile(uid, username=None, location=None, preferences=None):
@@ -144,12 +150,16 @@ def update_reward_score(delta: int):
         cursor.execute("UPDATE user_profile SET score = ? WHERE id = 1", (new_score,))
         conn.commit()
 
-def process_negative_feedback(feedback: str) -> str:
-    negative_keywords = ["no", "wrong", "that not right", "incorrect", "not correct"]
-    if any(kw in feedback.lower() for kw in negative_keywords):
-        update_reward_score(-5)
-        return "Negative feedback noted. Your reward score has been reduced."
-    return ""
+def process_negative_feedback(original_question: str, feedback: str) -> str:
+    if not feedback:
+        return "No valid feedback provided."
+
+    update_reward_score(-5)  # Trừ điểm nếu feedback tiêu cực
+    add_learned_responses(original_question, feedback)  # Cập nhật kiến thức
+    new_answer = generate_flexible_response(feedback)  # Tạo câu trả lời mới
+
+    return f"Thank you for your feedback. Here is the updated answer: {new_answer}"
+
 
 # -----------------------------------------------------------------------------
 # GHI NHẬN SỬ DỤNG: bài hát & ứng dụng
@@ -245,7 +255,7 @@ def extract_appointment_details(command: str) -> dict:
 # -----------------------------------------------------------------------------
 # TÍNH NĂNG ĐẶT LỊCH HẸN
 # -----------------------------------------------------------------------------
-def handle_set_appointment(command: str) -> str:
+def handle_set_appointment(command: str, uid) -> str:
     details = extract_appointment_details(command)
     if not details["person"]:
         update_reward_score(-5)
@@ -263,7 +273,7 @@ def handle_set_appointment(command: str) -> str:
         dt = dt.replace(hour=9, minute=0, second=0, microsecond=0)
     start_time = dt
     end_time = start_time + timedelta(hours=1)
-    service = authenticate_google_calendar()
+    service = authenticate_google_calendar(uid)
     event_link = create_event(service, f"Meeting with {details['person']}",
                               start_time.isoformat(), end_time.isoformat())
     update_reward_score(10)
@@ -417,18 +427,55 @@ def handle_ai_question(command: str) -> str:
 # PHẦN XỬ LÝ LỆNH HỆ THỐNG (shutdown, restart, brightness, mute, unmute)
 # -----------------------------------------------------------------------------
 def mute_sound() -> str:
-    devices = AudioUtilities.GetSpeakers()
-    interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-    volume = cast(interface, POINTER(IAudioEndpointVolume))
-    volume.SetMute(1, None)
-    return "Sound muted."
+    try:
+        # 📌 Khởi tạo COM (Tránh lỗi CoInitialize)
+        windll.ole32.CoInitialize(None)
+
+        # 📌 Lấy thiết bị loa mặc định
+        devices = AudioUtilities.GetSpeakers()
+        if not devices:
+            return "❌ Không tìm thấy thiết bị âm thanh."
+
+        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        volume = cast(interface, POINTER(IAudioEndpointVolume))
+
+        # 📌 Kiểm tra nếu đã mute rồi thì không mute nữa
+        if volume.GetMute():
+            return "ℹ️ Âm thanh đã bị tắt trước đó."
+
+        # 📌 Thực hiện mute
+        volume.SetMute(1, None)
+        return "✅ Âm thanh đã được tắt (Muted)."
+
+    except Exception as e:
+        return f"❌ Lỗi khi tắt âm thanh: {e}"
+
+    finally:
+        windll.ole32.CoUninitialize()  # Dọn dẹp COM sau khi dùng
 
 def unmute_sound() -> str:
-    devices = AudioUtilities.GetSpeakers()
-    interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-    volume = cast(interface, POINTER(IAudioEndpointVolume))
-    volume.SetMute(0, None)
-    return "Sound unmuted."
+    try:
+        # Khởi tạo COM trước khi dùng
+        windll.ole32.CoInitialize(None)  
+
+        devices = AudioUtilities.GetSpeakers()
+        if not devices:
+            return "❌ Không tìm thấy thiết bị âm thanh."
+
+        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        volume = cast(interface, POINTER(IAudioEndpointVolume))
+
+        if volume.GetMute():
+            volume.SetMute(0, None)
+            return "✅ Đã bật âm thanh (Unmuted)."
+        else:
+            return "ℹ️ Âm thanh đã được bật từ trước."
+
+    except Exception as e:
+        return f"❌ Lỗi khi thay đổi âm thanh: {e}"
+
+    finally:
+        windll.ole32.CoUninitialize()  # Dọn dẹp COM sau khi dùng
 
 def increase_brightness() -> str:
     current_brightness = sbc.get_brightness()[0]
@@ -588,22 +635,29 @@ youtube = build("youtube", "v3", developerKey=API_KEY)
 # -----------------------------------------------------------------------------
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
-def authenticate_google_calendar():
+def authenticate_google_calendar(uid):
     creds = None
-    if os.path.exists('token.json'):
+    token_file = f'token_{uid}.json'  # File token riêng cho từng UID
+    base_path = os.path.dirname(os.path.abspath(__file__))  # 📌 Lấy thư mục chứa main.py
+    credentials_path = os.path.join(base_path, "credentials.json")  # ✅ Đường dẫn tuyệt đối
+
+    if os.path.exists(token_file):
         try:
-            creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+            creds = Credentials.from_authorized_user_file(token_file, SCOPES)
         except ValueError as e:
             print(f"Error loading credentials: {e}")
-            os.remove('token.json')
+            os.remove(token_file)
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)  # 🔥 Dùng đường dẫn tuyệt đối
             creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token:
+
+        with open(token_file, 'w') as token:
             token.write(creds.to_json())
+
     service = build('calendar', 'v3', credentials=creds)
     return service
 
@@ -618,8 +672,8 @@ def create_event(service, summary, start_time, end_time, description=None, locat
     event = service.events().insert(calendarId='primary', body=event).execute()
     return event.get('htmlLink')
 
-def get_upcoming_appointments(limit=5) -> list:
-    service = authenticate_google_calendar()
+def get_upcoming_appointments(uid, limit=5):
+    service = authenticate_google_calendar(uid)
     now = datetime.utcnow().isoformat() + 'Z'
     events_result = service.events().list(calendarId='primary', timeMin=now,
                                           maxResults=limit, singleEvents=True,
@@ -642,67 +696,112 @@ def normalize_topic(query: str) -> str:
 def compute_answer_quality(answer: str) -> float:
     return 0.8 if len(answer) > 50 else 0.5
 
-def handle_knowledge_query_custom(query: str) -> str:
+def handle_knowledge_query_custom(query: str) -> dict:
+    """Xử lý câu hỏi kiến thức và trả về kết quả phù hợp."""
     topic_key = normalize_topic(query)
     learned = get_learned_responses(topic_key)
+
     if learned:
         raw_data = learned[0]
     else:
         refined_query = refine_query(query)
         raw_data = enhanced_aggregate_search_results(refined_query, num_results=5)
-    
+
     answer = generate_flexible_response(raw_data)
     quality = compute_answer_quality(answer)
     automatic_accept_threshold = 0.75
+
     if quality >= automatic_accept_threshold:
-        print("\nAI's answer:")
-        print(answer)
         if not learned:
             add_learned_responses(topic_key, raw_data)
         update_reward_score(2)
-        return answer
+        return {"answer": answer, "status": "success"}
     else:
-        print("\nInitial answer quality low, trying alternative search results...")
+        # 📌 Nếu chất lượng thấp, thử tìm kiếm lại
         alternative_raw_data = enhanced_aggregate_search_results(refine_query(query), num_results=10)
         alternative_answer = generate_flexible_response(alternative_raw_data)
         quality2 = compute_answer_quality(alternative_answer)
+
         if quality2 >= automatic_accept_threshold:
-            print("\nAI's improved answer:")
-            print(alternative_answer)
             if not learned:
                 add_learned_responses(topic_key, alternative_raw_data)
             update_reward_score(1)
-            return alternative_answer
+            return {"answer": alternative_answer, "status": "success"}
         else:
-            print("\nQuality still low after alternative search.")
-            feedback = input("Please provide the correct information for this query: ").strip()
-            if feedback:
-                add_learned_responses(topic_key, feedback)
-                new_answer = generate_flexible_response(feedback)
-                update_reward_score(5)
-                return f"Thank you for your feedback. Here is the updated answer:\n{new_answer}"
-            else:
-                update_reward_score(-5)
-                return "No new information provided. Using initial answer:\n" + answer
+            # 📌 Không có câu trả lời chính xác, yêu cầu người dùng cung cấp phản hồi
+            update_reward_score(-5)
+            return {
+                "answer": "Không có câu trả lời phù hợp, hãy cung cấp phản hồi!",
+                "status": "feedback_requested"
+            }
 
-def dynamic_respond(query: str) -> str:
-    query_lower = query.lower()
-    for category, data in ai_qa.items():
-        for pattern in data["patterns"]:
-            if re.search(pattern, query, re.IGNORECASE):
-                return random.choice(data["responses"])
-    if "how to" in query_lower or "what is" in query_lower:
+
+def dynamic_respond(query: str, uid: str = None, is_teaching: bool = False, teach_response: str = None) -> dict:
+    query_lower = query.lower().strip()
+    user_profile = get_user_profile(uid) if uid else None
+    username = user_profile.get("username", "User") if user_profile else "User"
+
+    # Nếu người dùng đang dạy AI
+    if is_teaching and teach_response:
+        add_learned_responses(query, teach_response)
+        return {
+            "answer": f"Thanks for teaching me, {username}! Here's the updated response: {generate_flexible_response(teach_response)}",
+            "status": "success"
+        }
+
+    # Xử lý các lệnh hệ thống
+    if any(cmd in query_lower for cmd in ["shut down", "turn off", "restart", "reboot", "brightness", "mute", "unmute"]):
+        return {"answer": handle_system_command(query), "status": "success"}
+    
+    # Mở ứng dụng
+    if "open" in query_lower:  # Sử dụng "open" thay vì chỉ "open " để linh hoạt hơn
+        return {"answer": handle_open_application(query), "status": "success"}
+    
+    # Phát nhạc
+    if "play" in query_lower:  # Sử dụng "play" thay vì chỉ "play " để linh hoạt hơn
+        return {"answer": handle_play_music(query), "status": "success"}
+    
+    # Kiểm tra thời tiết
+    if "weather" in query_lower:
+        return {"answer": handle_check_weather(query, WEATHERAPI_API_KEY, uid), "status": "success"}
+    
+    # Đặt lịch hẹn
+    if "set an appointment" in query_lower or "schedule a meeting" in query_lower:
+        return {"answer": handle_set_appointment(query, uid), "status": "success"}
+    
+    # Kiểm tra lịch hẹn
+    if re.search(r"(remind me about appointments|what are my upcoming appointments)", query_lower, re.IGNORECASE):
+        return {"answer": check_appointment_reminders(uid), "status": "success"}
+    
+    # Đặt tên người dùng
+    if re.search(r"(set my name as|my name is)", query_lower, re.IGNORECASE):
+        return {"answer": handle_set_username(query,uid), "status": "success"}
+    
+    # Đặt vị trí
+    if re.search(r"(set my location as|my location is)", query_lower, re.IGNORECASE):
+        return {"answer": handle_set_location(query,uid), "status": "success"}
+    
+    # Câu hỏi về AI
+    if any(keyword in query_lower for keyword in [
+            "who are you", "what are you", "tell me about yourself", "your name",
+            "who created you", "who made you"]):
+        ai_response = handle_ai_question(query)
+        if ai_response:
+            return {"answer": ai_response, "status": "success"}
+    
+    # Câu hỏi kiến thức
+    if any(kw in query_lower for kw in ["how ", "what ", "when", "who", "search"]) or "?" in query_lower:
         return handle_knowledge_query_custom(query)
+    
+    # Kiểm tra tri thức đã học
     learned = get_learned_responses(query)
     if learned:
-        basic_data = random.choice(learned)
-        return generate_flexible_response(basic_data)
-    user_input = input(f"I don't know about '{query}'. Can you teach me? ").strip()
-    if user_input:
-        add_learned_responses(query, user_input)
-        return generate_flexible_response(user_input)
-    else:
-        return f"Sorry, I don't have any information about '{query}'."
+        return {"answer": generate_flexible_response(random.choice(learned)), "status": "success"}
+
+    # Nếu không có câu trả lời, thử tìm kiếm tri thức trước khi yêu cầu dạy
+    return handle_knowledge_query_custom(query)  # Thay vì yêu cầu dạy ngay, thử tìm kiếm
+
+
 
 def learn_new_knowledge(query: str) -> str:
     if "how to" in query.lower() or "what is" in query.lower():
@@ -718,7 +817,7 @@ def learn_new_knowledge(query: str) -> str:
 # -----------------------------------------------------------------------------
 # PHẦN KIỂM TRA THỜI TIẾT VÀ LỜI KHUYẾN
 # -----------------------------------------------------------------------------
-def get_weather(city_name: str, api_key: str) -> str:
+def get_weather(city_name: str, api_key: str, uid: str = None) -> str:
     base_url = "http://api.weatherapi.com/v1/current.json"
     params = {"key": api_key, "q": city_name}
     try:
@@ -729,32 +828,27 @@ def get_weather(city_name: str, api_key: str) -> str:
         weather_description = weather_data["current"]["condition"]["text"]
         humidity = weather_data["current"]["humidity"]
         wind_speed = weather_data["current"]["wind_kph"]
-        upcoming = get_upcoming_appointments(limit=1)
-        if any(keyword in weather_description.lower() for keyword in ["rain", "storm", "snow", "hail"]):
-            advice = "It looks like bad weather; if you go out, remember to bring an umbrella and warm clothes."
-        elif not upcoming:
-            advice = "The weather is beautiful and you have no appointments today. How about going out for a walk or exercise?"
-        else:
-            advice = "The weather is pleasant, but you have appointments scheduled."
+        advice = "Enjoy your day!"
+        if uid:
+            upcoming = get_upcoming_appointments(uid, limit=1)
+            if any(keyword in weather_description.lower() for keyword in ["rain", "storm", "snow", "hail"]):
+                advice = "It looks like bad weather; if you go out, remember to bring an umbrella and warm clothes."
+            elif not upcoming:
+                advice = "The weather is beautiful and you have no appointments today. How about going out for a walk or exercise?"
+            else:
+                advice = "The weather is pleasant, but you have appointments scheduled."
         return (f"Weather in {city_name}: {weather_description}, "
                 f"Temperature: {temperature}°C, Humidity: {humidity}%, "
                 f"Wind Speed: {wind_speed} km/h. {advice}")
     except requests.exceptions.HTTPError as e:
-        if response.status_code == 401:
-            return "Error: Invalid API Key."
-        elif response.status_code == 400:
-            return f"Error: City '{city_name}' not found."
-        else:
-            return f"Error fetching weather data: {e}"
-    except requests.exceptions.RequestException as e:
-        return f"Error fetching weather data: {e}"
+        return f"Error fetching weather data: {e.response.status_code}"
 
-def handle_check_weather(command: str, api_key: str) -> str:
+def handle_check_weather(command: str, api_key: str, uid: str = None) -> str:
     city_name = extract_location(command)
     if city_name:
         city_name = city_name.title()
         update_reward_score(1)
-        return get_weather(city_name, api_key)
+        return get_weather(city_name, api_key, uid)
     else:
         return "Please specify a city name."
 
@@ -763,8 +857,8 @@ WEATHERAPI_API_KEY = "5e65619e9ff54500a5c62422250103"
 # -----------------------------------------------------------------------------
 # PHẦN NHẮC LẠI LỊCH HẸN
 # -----------------------------------------------------------------------------
-def check_appointment_reminders() -> str:
-    events = get_upcoming_appointments()
+def check_appointment_reminders(uid) -> str:
+    events = get_upcoming_appointments(uid)
     if events:
         reminders = "Upcoming appointments:\n"
         for event in events:
@@ -784,31 +878,31 @@ def personalize_response(response: str) -> str:
         return f"Hello {profile['username']}, {response}"
     return response
 
-def handle_set_username(command: str) -> str:
+def handle_set_username(command: str, uid: str = None) -> str:
     m = re.search(r"(?:set my name as|my name is)\s+(.*)", command, re.IGNORECASE)
     if m:
         username = m.group(1).strip()
-        update_user_profile(username=username)
+        update_user_profile(uid, username=username)  # Truyền uid vào
         update_reward_score(10)
         return f"Your name has been set to {username}."
     else:
         update_reward_score(-5)
         return "Could not extract your name. Please try again."
 
-def handle_set_location(command: str) -> str:
+def handle_set_location(command: str, uid: str = None) -> str:
     m = re.search(r"(?:set my location as|my location is)\s+(.*)", command, re.IGNORECASE)
     if m:
         location = m.group(1).strip()
-        update_user_profile(location=location)
+        update_user_profile(uid, location=location)  # Truyền uid vào
         update_reward_score(5)
         return f"Your location has been set to {location}."
     else:
         update_reward_score(-5)
         return "Could not extract your location. Please try again."
 
-def greet_user(uid, username=None, location=None) -> dict:
+def greet_user(uid=None , username=None, location=None) -> dict:
     """Trả về lời chào hoặc yêu cầu nhập thông tin nếu thiếu username hoặc location."""
-    profile = get_user_profile(uid)  # ✅ Truy vấn user theo UID
+    profile = get_user_profile(uid) or {} # ✅ Truy vấn user theo UID
 
     # Trường hợp 1: Nếu chưa có username
     if not profile or not profile.get("username"):
@@ -825,7 +919,7 @@ def greet_user(uid, username=None, location=None) -> dict:
 
     # Nếu đủ thông tin, trả về lời chào kèm thời tiết
     profile = get_user_profile(uid)  # ✅ Lấy profile sau khi cập nhật thông tin
-    weather_info = get_weather(profile["location"], WEATHERAPI_API_KEY)
+    weather_info = get_weather(profile["location"], WEATHERAPI_API_KEY,uid)
     score = profile["score"]
 
     return {"message": f"Hello {profile['username']}! Your current reward score is {score}. {weather_info}"}
@@ -897,68 +991,112 @@ def display_personalized_recommendations():
 # -----------------------------------------------------------------------------
 # PHẦN XỬ LÝ TRI THỨC: FLAN-T5 với phản hồi tiêu cực và thử kết quả tìm kiếm khác
 # -----------------------------------------------------------------------------
-def handle_knowledge_query_custom(query: str) -> str:
+def handle_knowledge_query_custom(query: str) -> dict:
+    """Xử lý câu hỏi kiến thức và trả về kết quả phù hợp."""
     topic_key = normalize_topic(query)
     learned = get_learned_responses(topic_key)
+
     if learned:
         raw_data = learned[0]
     else:
         refined_query = refine_query(query)
         raw_data = enhanced_aggregate_search_results(refined_query, num_results=5)
-    
+
     answer = generate_flexible_response(raw_data)
     quality = compute_answer_quality(answer)
     automatic_accept_threshold = 0.75
 
     if quality >= automatic_accept_threshold:
-        print("\nAI's answer:")
-        print(answer)
         if not learned:
             add_learned_responses(topic_key, raw_data)
         update_reward_score(2)
-        return answer
+        return {"answer": answer, "status": "success"}
     else:
-        print("\nInitial answer quality low, trying alternative search results...")
+        # 📌 Nếu chất lượng thấp, thử tìm kiếm lại
         alternative_raw_data = enhanced_aggregate_search_results(refine_query(query), num_results=10)
         alternative_answer = generate_flexible_response(alternative_raw_data)
         quality2 = compute_answer_quality(alternative_answer)
+
         if quality2 >= automatic_accept_threshold:
-            print("\nAI's improved answer:")
-            print(alternative_answer)
             if not learned:
                 add_learned_responses(topic_key, alternative_raw_data)
             update_reward_score(1)
-            return alternative_answer
+            return {"answer": alternative_answer, "status": "success"}
         else:
-            print("\nQuality still low after alternative search.")
-            feedback = input("Please provide the correct information for this query: ").strip()
-            if feedback:
-                add_learned_responses(topic_key, feedback)
-                new_answer = generate_flexible_response(feedback)
-                update_reward_score(5)
-                return f"Thank you for your feedback. Here is the updated answer:\n{new_answer}"
-            else:
-                update_reward_score(-5)
-                return "No new information provided. Using initial answer:\n" + answer
+            # 📌 Không có câu trả lời chính xác, yêu cầu người dùng cung cấp phản hồi
+            update_reward_score(-5)
+            return {
+                "answer": "Không có câu trả lời phù hợp, hãy cung cấp phản hồi!",
+                "status": "feedback_requested"
+            }
 
-def dynamic_respond(query: str) -> str:
-    query_lower = query.lower()
-    for category, data in ai_qa.items():
-        for pattern in data["patterns"]:
-            if re.search(pattern, query, re.IGNORECASE):
-                return random.choice(data["responses"])
-    if "how to" in query_lower or "what is" in query_lower:
+
+def dynamic_respond(query: str, uid: str = None, is_teaching: bool = False, teach_response: str = None) -> dict:
+    query_lower = query.lower().strip()
+    user_profile = get_user_profile(uid) if uid else None
+    username = user_profile.get("username", "User") if user_profile else "User"
+
+    # Nếu người dùng đang dạy AI
+    if is_teaching and teach_response:
+        add_learned_responses(query, teach_response)
+        return {
+            "answer": f"Thanks for teaching me, {username}! Here's the updated response: {generate_flexible_response(teach_response)}",
+            "status": "success"
+        }
+
+    # Xử lý các lệnh hệ thống
+    if any(cmd in query_lower for cmd in ["shut down", "turn off", "restart", "reboot", "brightness", "mute", "unmute"]):
+        return {"answer": handle_system_command(query), "status": "success"}
+    
+    # Mở ứng dụng
+    if "open" in query_lower:  # Sử dụng "open" thay vì chỉ "open " để linh hoạt hơn
+        return {"answer": handle_open_application(query), "status": "success"}
+    
+    # Phát nhạc
+    if "play" in query_lower:  # Sử dụng "play" thay vì chỉ "play " để linh hoạt hơn
+        return {"answer": handle_play_music(query), "status": "success"}
+    
+    # Kiểm tra thời tiết
+    if "weather" in query_lower:
+        return {"answer": handle_check_weather(query, WEATHERAPI_API_KEY, uid), "status": "success"}
+    
+    # Đặt lịch hẹn
+    if "set an appointment" in query_lower or "schedule a meeting" in query_lower:
+        return {"answer": handle_set_appointment(query, uid), "status": "success"}
+    
+    # Kiểm tra lịch hẹn
+    if re.search(r"(remind me about appointments|what are my upcoming appointments)", query_lower, re.IGNORECASE):
+        return {"answer": check_appointment_reminders(uid), "status": "success"}
+    
+    # Đặt tên người dùng
+    if re.search(r"(set my name as|my name is)", query_lower, re.IGNORECASE):
+        return {"answer": handle_set_username(query,uid), "status": "success"}
+    
+    # Đặt vị trí
+    if re.search(r"(set my location as|my location is)", query_lower, re.IGNORECASE):
+        return {"answer": handle_set_location(query,uid), "status": "success"}
+    
+    # Câu hỏi về AI
+    if any(keyword in query_lower for keyword in [
+            "who are you", "what are you", "tell me about yourself", "your name",
+            "who created you", "who made you"]):
+        ai_response = handle_ai_question(query)
+        if ai_response:
+            return {"answer": ai_response, "status": "success"}
+    
+    # Câu hỏi kiến thức
+    if any(kw in query_lower for kw in ["how ", "what ", "when", "who", "search"]) or "?" in query_lower:
         return handle_knowledge_query_custom(query)
+    
+    # Kiểm tra tri thức đã học
     learned = get_learned_responses(query)
     if learned:
-        basic_data = random.choice(learned)
-        return generate_flexible_response(basic_data)
-    user_input = input(f"I don't know about '{query}'. Can you teach me? ").strip()
-    if user_input:
-        add_learned_responses(query, user_input)
-        return generate_flexible_response(user_input)
-    else:
-        return f"Sorry, I don't have any information about '{query}'."
+        return {"answer": generate_flexible_response(random.choice(learned)), "status": "success"}
+
+    # Nếu không có câu trả lời, thử tìm kiếm tri thức trước khi yêu cầu dạy
+    return handle_knowledge_query_custom(query)  # Thay vì yêu cầu dạy ngay, thử tìm kiếm
+
+
 
 def learn_new_knowledge(query: str) -> str:
     if "how to" in query.lower() or "what is" in query.lower():
@@ -974,51 +1112,39 @@ def learn_new_knowledge(query: str) -> str:
 # -----------------------------------------------------------------------------
 # PHẦN KIỂM TRA THỜI TIẾT VÀ LỜI KHUYẾN
 # -----------------------------------------------------------------------------
-def get_weather(city_name: str, api_key: str) -> str:
-    if not city_name:  # Kiểm tra city_name trước khi gọi API
-        return "Error: Location not provided. Please update your profile."
-
+def get_weather(city_name: str, api_key: str, uid: str = None) -> str:
     base_url = "http://api.weatherapi.com/v1/current.json"
     params = {"key": api_key, "q": city_name}
-
     try:
         response = requests.get(base_url, params=params)
         response.raise_for_status()
         weather_data = response.json()
-        
-        temperature = weather_data.get("current", {}).get("temp_c", "N/A")
-        weather_description = weather_data.get("current", {}).get("condition", {}).get("text", "Unknown")
-        humidity = weather_data.get("current", {}).get("humidity", "N/A")
-        wind_speed = weather_data.get("current", {}).get("wind_kph", "N/A")
-
-        upcoming = get_upcoming_appointments(limit=1)
-        if any(keyword in str(weather_description).lower() for keyword in ["rain", "storm", "snow", "hail"]):
-            advice = "It looks like bad weather; if you go out, remember to bring an umbrella and warm clothes."
-        elif not upcoming:
-            advice = "The weather is beautiful and you have no appointments today. How about going out for a walk or exercise?"
-        else:
-            advice = "The weather is pleasant, but you have appointments scheduled."
-
+        temperature = weather_data["current"]["temp_c"]
+        weather_description = weather_data["current"]["condition"]["text"]
+        humidity = weather_data["current"]["humidity"]
+        wind_speed = weather_data["current"]["wind_kph"]
+        advice = "Enjoy your day!"
+        if uid:
+            upcoming = get_upcoming_appointments(uid, limit=1)
+            if any(keyword in weather_description.lower() for keyword in ["rain", "storm", "snow", "hail"]):
+                advice = "It looks like bad weather; if you go out, remember to bring an umbrella and warm clothes."
+            elif not upcoming:
+                advice = "The weather is beautiful and you have no appointments today. How about going out for a walk or exercise?"
+            else:
+                advice = "The weather is pleasant, but you have appointments scheduled."
         return (f"Weather in {city_name}: {weather_description}, "
                 f"Temperature: {temperature}°C, Humidity: {humidity}%, "
                 f"Wind Speed: {wind_speed} km/h. {advice}")
     except requests.exceptions.HTTPError as e:
-        if 'response' in locals() and response.status_code == 401:
-            return "Error: Invalid API Key."
-        elif 'response' in locals() and response.status_code == 400:
-            return f"Error: City '{city_name}' not found."
-        else:
-            return f"Error fetching weather data: {e}"
-    except requests.exceptions.RequestException as e:
-        return f"Error fetching weather data: {e}"
+        return f"Error fetching weather data: {e.response.status_code}"
 
 
-def handle_check_weather(command: str, api_key: str) -> str:
+def handle_check_weather(command: str, api_key: str, uid: str = None) -> str:
     city_name = extract_location(command)
     if city_name:
         city_name = city_name.title()
         update_reward_score(1)
-        return get_weather(city_name, api_key)
+        return get_weather(city_name, api_key, uid)
     else:
         return "Please specify a city name."
 
@@ -1027,8 +1153,8 @@ WEATHERAPI_API_KEY = "5e65619e9ff54500a5c62422250103"
 # -----------------------------------------------------------------------------
 # PHẦN NHẮC LẠI LỊCH HẸN
 # -----------------------------------------------------------------------------
-def check_appointment_reminders() -> str:
-    events = get_upcoming_appointments()
+def check_appointment_reminders(uid) -> str:
+    events = get_upcoming_appointments(uid)
     if events:
         reminders = "Upcoming appointments:\n"
         for event in events:
@@ -1048,31 +1174,31 @@ def personalize_response(response: str) -> str:
         return f"Hello {profile['username']}, {response}"
     return response
 
-def handle_set_username(command: str) -> str:
+def handle_set_username(command: str, uid: str = None) -> str:
     m = re.search(r"(?:set my name as|my name is)\s+(.*)", command, re.IGNORECASE)
     if m:
         username = m.group(1).strip()
-        update_user_profile(username=username)
+        update_user_profile(uid, username=username)  # Truyền uid vào
         update_reward_score(10)
         return f"Your name has been set to {username}."
     else:
         update_reward_score(-5)
         return "Could not extract your name. Please try again."
 
-def handle_set_location(command: str) -> str:
+def handle_set_location(command: str, uid: str = None) -> str:
     m = re.search(r"(?:set my location as|my location is)\s+(.*)", command, re.IGNORECASE)
     if m:
         location = m.group(1).strip()
-        update_user_profile(location=location)
+        update_user_profile(uid, location=location)  # Truyền uid vào
         update_reward_score(5)
         return f"Your location has been set to {location}."
     else:
         update_reward_score(-5)
         return "Could not extract your location. Please try again."
 
-def greet_user(uid, username=None, location=None) -> dict:
+def greet_user(uid=None , username=None, location=None) -> dict:
     """Trả về lời chào hoặc yêu cầu nhập thông tin nếu thiếu username hoặc location."""
-    profile = get_user_profile(uid)  # ✅ Truy vấn user theo UID
+    profile = get_user_profile(uid) or {} # ✅ Truy vấn user theo UID
 
     # Trường hợp 1: Nếu chưa có username
     if not profile or not profile.get("username"):
@@ -1089,7 +1215,7 @@ def greet_user(uid, username=None, location=None) -> dict:
 
     # Nếu đủ thông tin, trả về lời chào kèm thời tiết
     profile = get_user_profile(uid)  # ✅ Lấy profile sau khi cập nhật thông tin
-    weather_info = get_weather(profile["location"], WEATHERAPI_API_KEY)
+    weather_info = get_weather(profile["location"], WEATHERAPI_API_KEY,uid)
     score = profile["score"]
 
     return {"message": f"Hello {profile['username']}! Your current reward score is {score}. {weather_info}"}
@@ -1159,67 +1285,112 @@ def display_personalized_recommendations():
 # -----------------------------------------------------------------------------
 # PHẦN XỬ LÝ TRI THỨC: FLAN-T5 với cơ chế thử kết quả tìm kiếm khác
 # -----------------------------------------------------------------------------
-def handle_knowledge_query_custom(query: str) -> str:
+def handle_knowledge_query_custom(query: str) -> dict:
+    """Xử lý câu hỏi kiến thức và trả về kết quả phù hợp."""
     topic_key = normalize_topic(query)
     learned = get_learned_responses(topic_key)
+
     if learned:
         raw_data = learned[0]
     else:
         refined_query = refine_query(query)
         raw_data = enhanced_aggregate_search_results(refined_query, num_results=5)
-    
+
     answer = generate_flexible_response(raw_data)
     quality = compute_answer_quality(answer)
     automatic_accept_threshold = 0.75
+
     if quality >= automatic_accept_threshold:
-        print("\nAI's answer:")
-        print(answer)
         if not learned:
             add_learned_responses(topic_key, raw_data)
         update_reward_score(2)
-        return answer
+        return {"answer": answer, "status": "success"}
     else:
-        print("\nInitial answer quality low, trying alternative search results...")
+        # 📌 Nếu chất lượng thấp, thử tìm kiếm lại
         alternative_raw_data = enhanced_aggregate_search_results(refine_query(query), num_results=10)
         alternative_answer = generate_flexible_response(alternative_raw_data)
         quality2 = compute_answer_quality(alternative_answer)
+
         if quality2 >= automatic_accept_threshold:
-            print("\nAI's improved answer:")
-            print(alternative_answer)
             if not learned:
                 add_learned_responses(topic_key, alternative_raw_data)
             update_reward_score(1)
-            return alternative_answer
+            return {"answer": alternative_answer, "status": "success"}
         else:
-            print("\nQuality still low after alternative search.")
-            feedback = input("Please provide the correct information for this query: ").strip()
-            if feedback:
-                add_learned_responses(topic_key, feedback)
-                new_answer = generate_flexible_response(feedback)
-                update_reward_score(5)
-                return f"Thank you for your feedback. Here is the updated answer:\n{new_answer}"
-            else:
-                update_reward_score(-5)
-                return "No new information provided. Using initial answer:\n" + answer
+            # 📌 Không có câu trả lời chính xác, yêu cầu người dùng cung cấp phản hồi
+            update_reward_score(-5)
+            return {
+                "answer": "Không có câu trả lời phù hợp, hãy cung cấp phản hồi!",
+                "status": "feedback_requested"
+            }
 
-def dynamic_respond(query: str) -> str:
-    query_lower = query.lower()
-    for category, data in ai_qa.items():
-        for pattern in data["patterns"]:
-            if re.search(pattern, query, re.IGNORECASE):
-                return random.choice(data["responses"])
-    if "how to" in query_lower or "what is" in query_lower:
+
+def dynamic_respond(query: str, uid: str = None, is_teaching: bool = False, teach_response: str = None) -> dict:
+    query_lower = query.lower().strip()
+    user_profile = get_user_profile(uid) if uid else None
+    username = user_profile.get("username", "User") if user_profile else "User"
+
+    # Nếu người dùng đang dạy AI
+    if is_teaching and teach_response:
+        add_learned_responses(query, teach_response)
+        return {
+            "answer": f"Thanks for teaching me, {username}! Here's the updated response: {generate_flexible_response(teach_response)}",
+            "status": "success"
+        }
+
+    # Xử lý các lệnh hệ thống
+    if any(cmd in query_lower for cmd in ["shut down", "turn off", "restart", "reboot", "brightness", "mute", "unmute"]):
+        return {"answer": handle_system_command(query), "status": "success"}
+    
+    # Mở ứng dụng
+    if "open" in query_lower:  # Sử dụng "open" thay vì chỉ "open " để linh hoạt hơn
+        return {"answer": handle_open_application(query), "status": "success"}
+    
+    # Phát nhạc
+    if "play" in query_lower:  # Sử dụng "play" thay vì chỉ "play " để linh hoạt hơn
+        return {"answer": handle_play_music(query), "status": "success"}
+    
+    # Kiểm tra thời tiết
+    if "weather" in query_lower:
+        return {"answer": handle_check_weather(query, WEATHERAPI_API_KEY, uid), "status": "success"}
+    
+    # Đặt lịch hẹn
+    if "set an appointment" in query_lower or "schedule a meeting" in query_lower:
+        return {"answer": handle_set_appointment(query, uid), "status": "success"}
+    
+    # Kiểm tra lịch hẹn
+    if re.search(r"(remind me about appointments|what are my upcoming appointments)", query_lower, re.IGNORECASE):
+        return {"answer": check_appointment_reminders(uid), "status": "success"}
+    
+    # Đặt tên người dùng
+    if re.search(r"(set my name as|my name is)", query_lower, re.IGNORECASE):
+        return {"answer": handle_set_username(query,uid), "status": "success"}
+    
+    # Đặt vị trí
+    if re.search(r"(set my location as|my location is)", query_lower, re.IGNORECASE):
+        return {"answer": handle_set_location(query,uid), "status": "success"}
+    
+    # Câu hỏi về AI
+    if any(keyword in query_lower for keyword in [
+            "who are you", "what are you", "tell me about yourself", "your name",
+            "who created you", "who made you"]):
+        ai_response = handle_ai_question(query)
+        if ai_response:
+            return {"answer": ai_response, "status": "success"}
+    
+    # Câu hỏi kiến thức
+    if any(kw in query_lower for kw in ["how ", "what ", "when", "who", "search"]) or "?" in query_lower:
         return handle_knowledge_query_custom(query)
+    
+    # Kiểm tra tri thức đã học
     learned = get_learned_responses(query)
     if learned:
-        basic_data = random.choice(learned)
-        return generate_flexible_response(basic_data)
-    user_input = input(f"I don't know about '{query}'. Can you teach me? ").strip()
-    if user_input:
-        add_learned_responses(query, user_input)
-        return generate_flexible_response(user_input)
-    else:
-        return f"Sorry, I don't have any information about '{query}'."
+        return {"answer": generate_flexible_response(random.choice(learned)), "status": "success"}
+
+    # Nếu không có câu trả lời, thử tìm kiếm tri thức trước khi yêu cầu dạy
+    return handle_knowledge_query_custom(query)  # Thay vì yêu cầu dạy ngay, thử tìm kiếm
+
+
 
 def learn_new_knowledge(query: str) -> str:
     if "how to" in query.lower() or "what is" in query.lower():
@@ -1235,7 +1406,7 @@ def learn_new_knowledge(query: str) -> str:
 # -----------------------------------------------------------------------------
 # PHẦN KIỂM TRA THỜI TIẾT VÀ LỜI KHUYẾN
 # -----------------------------------------------------------------------------
-def get_weather(city_name: str, api_key: str) -> str:
+def get_weather(city_name: str, api_key: str, uid: str = None) -> str:
     base_url = "http://api.weatherapi.com/v1/current.json"
     params = {"key": api_key, "q": city_name}
     try:
@@ -1246,32 +1417,27 @@ def get_weather(city_name: str, api_key: str) -> str:
         weather_description = weather_data["current"]["condition"]["text"]
         humidity = weather_data["current"]["humidity"]
         wind_speed = weather_data["current"]["wind_kph"]
-        upcoming = get_upcoming_appointments(limit=1)
-        if any(keyword in weather_description.lower() for keyword in ["rain", "storm", "snow", "hail"]):
-            advice = "It looks like bad weather; if you go out, remember to bring an umbrella and warm clothes."
-        elif not upcoming:
-            advice = "The weather is beautiful and you have no appointments today. How about going out for a walk or exercise?"
-        else:
-            advice = "The weather is pleasant, but you have appointments scheduled."
+        advice = "Enjoy your day!"
+        if uid:
+            upcoming = get_upcoming_appointments(uid, limit=1)
+            if any(keyword in weather_description.lower() for keyword in ["rain", "storm", "snow", "hail"]):
+                advice = "It looks like bad weather; if you go out, remember to bring an umbrella and warm clothes."
+            elif not upcoming:
+                advice = "The weather is beautiful and you have no appointments today. How about going out for a walk or exercise?"
+            else:
+                advice = "The weather is pleasant, but you have appointments scheduled."
         return (f"Weather in {city_name}: {weather_description}, "
                 f"Temperature: {temperature}°C, Humidity: {humidity}%, "
                 f"Wind Speed: {wind_speed} km/h. {advice}")
     except requests.exceptions.HTTPError as e:
-        if response.status_code == 401:
-            return "Error: Invalid API Key."
-        elif response.status_code == 400:
-            return f"Error: City '{city_name}' not found."
-        else:
-            return f"Error fetching weather data: {e}"
-    except requests.exceptions.RequestException as e:
-        return f"Error fetching weather data: {e}"
+        return f"Error fetching weather data: {e.response.status_code}"
 
-def handle_check_weather(command: str, api_key: str) -> str:
+def handle_check_weather(command: str, api_key: str, uid: str = None) -> str:
     city_name = extract_location(command)
     if city_name:
         city_name = city_name.title()
         update_reward_score(1)
-        return get_weather(city_name, api_key)
+        return get_weather(city_name, api_key, uid)
     else:
         return "Please specify a city name."
 
@@ -1280,8 +1446,8 @@ WEATHERAPI_API_KEY = "5e65619e9ff54500a5c62422250103"
 # -----------------------------------------------------------------------------
 # PHẦN NHẮC LẠI LỊCH HẸN
 # -----------------------------------------------------------------------------
-def check_appointment_reminders() -> str:
-    events = get_upcoming_appointments()
+def check_appointment_reminders(uid) -> str:
+    events = get_upcoming_appointments(uid)
     if events:
         reminders = "Upcoming appointments:\n"
         for event in events:
@@ -1301,31 +1467,31 @@ def personalize_response(response: str) -> str:
         return f"Hello {profile['username']}, {response}"
     return response
 
-def handle_set_username(command: str) -> str:
+def handle_set_username(command: str, uid: str = None) -> str:
     m = re.search(r"(?:set my name as|my name is)\s+(.*)", command, re.IGNORECASE)
     if m:
         username = m.group(1).strip()
-        update_user_profile(username=username)
+        update_user_profile(uid, username=username)  # Truyền uid vào
         update_reward_score(10)
         return f"Your name has been set to {username}."
     else:
         update_reward_score(-5)
         return "Could not extract your name. Please try again."
 
-def handle_set_location(command: str) -> str:
+def handle_set_location(command: str, uid: str = None) -> str:
     m = re.search(r"(?:set my location as|my location is)\s+(.*)", command, re.IGNORECASE)
     if m:
         location = m.group(1).strip()
-        update_user_profile(location=location)
+        update_user_profile(uid, location=location)  # Truyền uid vào
         update_reward_score(5)
         return f"Your location has been set to {location}."
     else:
         update_reward_score(-5)
         return "Could not extract your location. Please try again."
 
-def greet_user(uid, username=None, location=None) -> dict:
+def greet_user(uid=None , username=None, location=None) -> dict:
     """Trả về lời chào hoặc yêu cầu nhập thông tin nếu thiếu username hoặc location."""
-    profile = get_user_profile(uid)  # ✅ Truy vấn user theo UID
+    profile = get_user_profile(uid) or {} # ✅ Truy vấn user theo UID
 
     # Trường hợp 1: Nếu chưa có username
     if not profile or not profile.get("username"):
@@ -1342,7 +1508,7 @@ def greet_user(uid, username=None, location=None) -> dict:
 
     # Nếu đủ thông tin, trả về lời chào kèm thời tiết
     profile = get_user_profile(uid)  # ✅ Lấy profile sau khi cập nhật thông tin
-    weather_info = get_weather(profile["location"], WEATHERAPI_API_KEY)
+    weather_info = get_weather(profile["location"], WEATHERAPI_API_KEY,uid)
     score = profile["score"]
 
     return {"message": f"Hello {profile['username']}! Your current reward score is {score}. {weather_info}"}
@@ -1412,67 +1578,112 @@ def display_personalized_recommendations():
 # -----------------------------------------------------------------------------
 # PHẦN XỬ LÝ TRI THỨC: FLAN-T5 với cơ chế thử kết quả tìm kiếm thay thế trước khi hỏi feedback
 # -----------------------------------------------------------------------------
-def handle_knowledge_query_custom(query: str) -> str:
+def handle_knowledge_query_custom(query: str) -> dict:
+    """Xử lý câu hỏi kiến thức và trả về kết quả phù hợp."""
     topic_key = normalize_topic(query)
     learned = get_learned_responses(topic_key)
+
     if learned:
         raw_data = learned[0]
     else:
         refined_query = refine_query(query)
         raw_data = enhanced_aggregate_search_results(refined_query, num_results=5)
-    
+
     answer = generate_flexible_response(raw_data)
     quality = compute_answer_quality(answer)
     automatic_accept_threshold = 0.75
+
     if quality >= automatic_accept_threshold:
-        print("\nAI's answer:")
-        print(answer)
         if not learned:
             add_learned_responses(topic_key, raw_data)
         update_reward_score(2)
-        return answer
+        return {"answer": answer, "status": "success"}
     else:
-        print("\nInitial answer quality low, trying alternative search results...")
+        # 📌 Nếu chất lượng thấp, thử tìm kiếm lại
         alternative_raw_data = enhanced_aggregate_search_results(refine_query(query), num_results=10)
         alternative_answer = generate_flexible_response(alternative_raw_data)
         quality2 = compute_answer_quality(alternative_answer)
+
         if quality2 >= automatic_accept_threshold:
-            print("\nAI's improved answer:")
-            print(alternative_answer)
             if not learned:
                 add_learned_responses(topic_key, alternative_raw_data)
             update_reward_score(1)
-            return alternative_answer
+            return {"answer": alternative_answer, "status": "success"}
         else:
-            print("\nQuality still low after alternative search.")
-            feedback = input("Please provide the correct information for this query: ").strip()
-            if feedback:
-                add_learned_responses(topic_key, feedback)
-                new_answer = generate_flexible_response(feedback)
-                update_reward_score(5)
-                return f"Thank you for your feedback. Here is the updated answer:\n{new_answer}"
-            else:
-                update_reward_score(-5)
-                return "No new information provided. Using initial answer:\n" + answer
+            # 📌 Không có câu trả lời chính xác, yêu cầu người dùng cung cấp phản hồi
+            update_reward_score(-5)
+            return {
+                "answer": "Không có câu trả lời phù hợp, hãy cung cấp phản hồi!",
+                "status": "feedback_requested"
+            }
 
-def dynamic_respond(query: str) -> str:
-    query_lower = query.lower()
-    for category, data in ai_qa.items():
-        for pattern in data["patterns"]:
-            if re.search(pattern, query, re.IGNORECASE):
-                return random.choice(data["responses"])
-    if "how to" in query_lower or "what is" in query_lower:
+
+def dynamic_respond(query: str, uid: str = None, is_teaching: bool = False, teach_response: str = None) -> dict:
+    query_lower = query.lower().strip()
+    user_profile = get_user_profile(uid) if uid else None
+    username = user_profile.get("username", "User") if user_profile else "User"
+
+    # Nếu người dùng đang dạy AI
+    if is_teaching and teach_response:
+        add_learned_responses(query, teach_response)
+        return {
+            "answer": f"Thanks for teaching me, {username}! Here's the updated response: {generate_flexible_response(teach_response)}",
+            "status": "success"
+        }
+
+    # Xử lý các lệnh hệ thống
+    if any(cmd in query_lower for cmd in ["shut down", "turn off", "restart", "reboot", "brightness", "mute", "unmute"]):
+        return {"answer": handle_system_command(query), "status": "success"}
+    
+    # Mở ứng dụng
+    if "open" in query_lower:  # Sử dụng "open" thay vì chỉ "open " để linh hoạt hơn
+        return {"answer": handle_open_application(query), "status": "success"}
+    
+    # Phát nhạc
+    if "play" in query_lower:  # Sử dụng "play" thay vì chỉ "play " để linh hoạt hơn
+        return {"answer": handle_play_music(query), "status": "success"}
+    
+    # Kiểm tra thời tiết
+    if "weather" in query_lower:
+        return {"answer": handle_check_weather(query, WEATHERAPI_API_KEY, uid), "status": "success"}
+    
+    # Đặt lịch hẹn
+    if "set an appointment" in query_lower or "schedule a meeting" in query_lower:
+        return {"answer": handle_set_appointment(query, uid), "status": "success"}
+    
+    # Kiểm tra lịch hẹn
+    if re.search(r"(remind me about appointments|what are my upcoming appointments)", query_lower, re.IGNORECASE):
+        return {"answer": check_appointment_reminders(uid), "status": "success"}
+    
+    # Đặt tên người dùng
+    if re.search(r"(set my name as|my name is)", query_lower, re.IGNORECASE):
+        return {"answer": handle_set_username(query,uid), "status": "success"}
+    
+    # Đặt vị trí
+    if re.search(r"(set my location as|my location is)", query_lower, re.IGNORECASE):
+        return {"answer": handle_set_location(query,uid), "status": "success"}
+    
+    # Câu hỏi về AI
+    if any(keyword in query_lower for keyword in [
+            "who are you", "what are you", "tell me about yourself", "your name",
+            "who created you", "who made you"]):
+        ai_response = handle_ai_question(query)
+        if ai_response:
+            return {"answer": ai_response, "status": "success"}
+    
+    # Câu hỏi kiến thức
+    if any(kw in query_lower for kw in ["how ", "what ", "when", "who", "search"]) or "?" in query_lower:
         return handle_knowledge_query_custom(query)
+    
+    # Kiểm tra tri thức đã học
     learned = get_learned_responses(query)
     if learned:
-        basic_data = random.choice(learned)
-        return generate_flexible_response(basic_data)
-    user_input = input(f"I don't know about '{query}'. Can you teach me? ").strip()
-    if user_input:
-        add_learned_responses(query, user_input)
-        return generate_flexible_response(user_input)
-    else:
-        return f"Sorry, I don't have any information about '{query}'."
+        return {"answer": generate_flexible_response(random.choice(learned)), "status": "success"}
+
+    # Nếu không có câu trả lời, thử tìm kiếm tri thức trước khi yêu cầu dạy
+    return handle_knowledge_query_custom(query)  # Thay vì yêu cầu dạy ngay, thử tìm kiếm
+
+
 
 def learn_new_knowledge(query: str) -> str:
     if "how to" in query.lower() or "what is" in query.lower():
@@ -1488,7 +1699,7 @@ def learn_new_knowledge(query: str) -> str:
 # -----------------------------------------------------------------------------
 # PHẦN KIỂM TRA THỜI TIẾT VÀ LỜI KHUYẾN
 # -----------------------------------------------------------------------------
-def get_weather(city_name: str, api_key: str) -> str:
+def get_weather(city_name: str, api_key: str, uid: str = None) -> str:
     base_url = "http://api.weatherapi.com/v1/current.json"
     params = {"key": api_key, "q": city_name}
     try:
@@ -1499,32 +1710,27 @@ def get_weather(city_name: str, api_key: str) -> str:
         weather_description = weather_data["current"]["condition"]["text"]
         humidity = weather_data["current"]["humidity"]
         wind_speed = weather_data["current"]["wind_kph"]
-        upcoming = get_upcoming_appointments(limit=1)
-        if any(keyword in weather_description.lower() for keyword in ["rain", "storm", "snow", "hail"]):
-            advice = "It looks like bad weather; if you go out, remember to bring an umbrella and warm clothes."
-        elif not upcoming:
-            advice = "The weather is beautiful and you have no appointments today. How about going out for a walk or exercise?"
-        else:
-            advice = "The weather is pleasant, but you have appointments scheduled."
+        advice = "Enjoy your day!"
+        if uid:
+            upcoming = get_upcoming_appointments(uid, limit=1)
+            if any(keyword in weather_description.lower() for keyword in ["rain", "storm", "snow", "hail"]):
+                advice = "It looks like bad weather; if you go out, remember to bring an umbrella and warm clothes."
+            elif not upcoming:
+                advice = "The weather is beautiful and you have no appointments today. How about going out for a walk or exercise?"
+            else:
+                advice = "The weather is pleasant, but you have appointments scheduled."
         return (f"Weather in {city_name}: {weather_description}, "
                 f"Temperature: {temperature}°C, Humidity: {humidity}%, "
                 f"Wind Speed: {wind_speed} km/h. {advice}")
     except requests.exceptions.HTTPError as e:
-        if response.status_code == 401:
-            return "Error: Invalid API Key."
-        elif response.status_code == 400:
-            return f"Error: City '{city_name}' not found."
-        else:
-            return f"Error fetching weather data: {e}"
-    except requests.exceptions.RequestException as e:
-        return f"Error fetching weather data: {e}"
+        return f"Error fetching weather data: {e.response.status_code}"
 
-def handle_check_weather(command: str, api_key: str) -> str:
+def handle_check_weather(command: str, api_key: str, uid: str = None) -> str:
     city_name = extract_location(command)
     if city_name:
         city_name = city_name.title()
         update_reward_score(1)
-        return get_weather(city_name, api_key)
+        return get_weather(city_name, api_key, uid)
     else:
         return "Please specify a city name."
 
@@ -1533,8 +1739,8 @@ WEATHERAPI_API_KEY = "5e65619e9ff54500a5c62422250103"
 # -----------------------------------------------------------------------------
 # PHẦN NHẮC LẠI LỊCH HẸN
 # -----------------------------------------------------------------------------
-def get_upcoming_appointments(limit=5) -> list:
-    service = authenticate_google_calendar()
+def get_upcoming_appointments(uid, limit=5):
+    service = authenticate_google_calendar(uid)
     now = datetime.utcnow().isoformat() + 'Z'
     events_result = service.events().list(calendarId='primary', timeMin=now,
                                           maxResults=limit, singleEvents=True,
@@ -1542,8 +1748,8 @@ def get_upcoming_appointments(limit=5) -> list:
     events = events_result.get('items', [])
     return events
 
-def check_appointment_reminders() -> str:
-    events = get_upcoming_appointments()
+def check_appointment_reminders(uid) -> str:
+    events = get_upcoming_appointments(uid)
     if events:
         reminders = "Upcoming appointments:\n"
         for event in events:
@@ -1563,31 +1769,31 @@ def personalize_response(response: str) -> str:
         return f"Hello {profile['username']}, {response}"
     return response
 
-def handle_set_username(command: str) -> str:
+def handle_set_username(command: str, uid: str = None) -> str:
     m = re.search(r"(?:set my name as|my name is)\s+(.*)", command, re.IGNORECASE)
     if m:
         username = m.group(1).strip()
-        update_user_profile(username=username)
+        update_user_profile(uid, username=username)  # Truyền uid vào
         update_reward_score(10)
         return f"Your name has been set to {username}."
     else:
         update_reward_score(-5)
         return "Could not extract your name. Please try again."
 
-def handle_set_location(command: str) -> str:
+def handle_set_location(command: str, uid: str = None) -> str:
     m = re.search(r"(?:set my location as|my location is)\s+(.*)", command, re.IGNORECASE)
     if m:
         location = m.group(1).strip()
-        update_user_profile(location=location)
+        update_user_profile(uid, location=location)  # Truyền uid vào
         update_reward_score(5)
         return f"Your location has been set to {location}."
     else:
         update_reward_score(-5)
         return "Could not extract your location. Please try again."
 
-def greet_user(uid, username=None, location=None) -> dict:
+def greet_user(uid=None , username=None, location=None) -> dict:
     """Trả về lời chào hoặc yêu cầu nhập thông tin nếu thiếu username hoặc location."""
-    profile = get_user_profile(uid)  # ✅ Truy vấn user theo UID
+    profile = get_user_profile(uid) or {} # ✅ Truy vấn user theo UID
 
     # Trường hợp 1: Nếu chưa có username
     if not profile or not profile.get("username"):
@@ -1604,7 +1810,7 @@ def greet_user(uid, username=None, location=None) -> dict:
 
     # Nếu đủ thông tin, trả về lời chào kèm thời tiết
     profile = get_user_profile(uid)  # ✅ Lấy profile sau khi cập nhật thông tin
-    weather_info = get_weather(profile["location"], WEATHERAPI_API_KEY)
+    weather_info = get_weather(profile["location"], WEATHERAPI_API_KEY,uid)
     score = profile["score"]
 
     return {"message": f"Hello {profile['username']}! Your current reward score is {score}. {weather_info}"}
@@ -1674,67 +1880,112 @@ def display_personalized_recommendations():
 # -----------------------------------------------------------------------------
 # PHẦN XỬ LÝ TRI THỨC: FLAN-T5 với cơ chế thử kết quả thay thế trước feedback
 # -----------------------------------------------------------------------------
-def handle_knowledge_query_custom(query: str) -> str:
+def handle_knowledge_query_custom(query: str) -> dict:
+    """Xử lý câu hỏi kiến thức và trả về kết quả phù hợp."""
     topic_key = normalize_topic(query)
     learned = get_learned_responses(topic_key)
+
     if learned:
         raw_data = learned[0]
     else:
         refined_query = refine_query(query)
         raw_data = enhanced_aggregate_search_results(refined_query, num_results=5)
-    
+
     answer = generate_flexible_response(raw_data)
     quality = compute_answer_quality(answer)
     automatic_accept_threshold = 0.75
+
     if quality >= automatic_accept_threshold:
-        print("\nAI's answer:")
-        print(answer)
         if not learned:
             add_learned_responses(topic_key, raw_data)
         update_reward_score(2)
-        return answer
+        return {"answer": answer, "status": "success"}
     else:
-        print("\nInitial answer quality low, trying alternative search results...")
+        # 📌 Nếu chất lượng thấp, thử tìm kiếm lại
         alternative_raw_data = enhanced_aggregate_search_results(refine_query(query), num_results=10)
         alternative_answer = generate_flexible_response(alternative_raw_data)
         quality2 = compute_answer_quality(alternative_answer)
+
         if quality2 >= automatic_accept_threshold:
-            print("\nAI's improved answer:")
-            print(alternative_answer)
             if not learned:
                 add_learned_responses(topic_key, alternative_raw_data)
             update_reward_score(1)
-            return alternative_answer
+            return {"answer": alternative_answer, "status": "success"}
         else:
-            print("\nQuality still low after alternative search.")
-            feedback = input("Please provide the correct information for this query: ").strip()
-            if feedback:
-                add_learned_responses(topic_key, feedback)
-                new_answer = generate_flexible_response(feedback)
-                update_reward_score(5)
-                return f"Thank you for your feedback. Here is the updated answer:\n{new_answer}"
-            else:
-                update_reward_score(-5)
-                return "No new information provided. Using initial answer:\n" + answer
+            # 📌 Không có câu trả lời chính xác, yêu cầu người dùng cung cấp phản hồi
+            update_reward_score(-5)
+            return {
+                "answer": "Không có câu trả lời phù hợp, hãy cung cấp phản hồi!",
+                "status": "feedback_requested"
+            }
 
-def dynamic_respond(query: str) -> str:
-    query_lower = query.lower()
-    for category, data in ai_qa.items():
-        for pattern in data["patterns"]:
-            if re.search(pattern, query, re.IGNORECASE):
-                return random.choice(data["responses"])
-    if "how to" in query_lower or "what is" in query_lower:
+
+def dynamic_respond(query: str, uid: str = None, is_teaching: bool = False, teach_response: str = None) -> dict:
+    query_lower = query.lower().strip()
+    user_profile = get_user_profile(uid) if uid else None
+    username = user_profile.get("username", "User") if user_profile else "User"
+
+    # Nếu người dùng đang dạy AI
+    if is_teaching and teach_response:
+        add_learned_responses(query, teach_response)
+        return {
+            "answer": f"Thanks for teaching me, {username}! Here's the updated response: {generate_flexible_response(teach_response)}",
+            "status": "success"
+        }
+
+    # Xử lý các lệnh hệ thống
+    if any(cmd in query_lower for cmd in ["shut down", "turn off", "restart", "reboot", "brightness", "mute", "unmute"]):
+        return {"answer": handle_system_command(query), "status": "success"}
+    
+    # Mở ứng dụng
+    if "open" in query_lower:  # Sử dụng "open" thay vì chỉ "open " để linh hoạt hơn
+        return {"answer": handle_open_application(query), "status": "success"}
+    
+    # Phát nhạc
+    if "play" in query_lower:  # Sử dụng "play" thay vì chỉ "play " để linh hoạt hơn
+        return {"answer": handle_play_music(query), "status": "success"}
+    
+    # Kiểm tra thời tiết
+    if "weather" in query_lower:
+        return {"answer": handle_check_weather(query, WEATHERAPI_API_KEY, uid), "status": "success"}
+    
+    # Đặt lịch hẹn
+    if "set an appointment" in query_lower or "schedule a meeting" in query_lower:
+        return {"answer": handle_set_appointment(query, uid), "status": "success"}
+    
+    # Kiểm tra lịch hẹn
+    if re.search(r"(remind me about appointments|what are my upcoming appointments)", query_lower, re.IGNORECASE):
+        return {"answer": check_appointment_reminders(uid), "status": "success"}
+    
+    # Đặt tên người dùng
+    if re.search(r"(set my name as|my name is)", query_lower, re.IGNORECASE):
+        return {"answer": handle_set_username(query,uid), "status": "success"}
+    
+    # Đặt vị trí
+    if re.search(r"(set my location as|my location is)", query_lower, re.IGNORECASE):
+        return {"answer": handle_set_location(query,uid), "status": "success"}
+    
+    # Câu hỏi về AI
+    if any(keyword in query_lower for keyword in [
+            "who are you", "what are you", "tell me about yourself", "your name",
+            "who created you", "who made you"]):
+        ai_response = handle_ai_question(query)
+        if ai_response:
+            return {"answer": ai_response, "status": "success"}
+    
+    # Câu hỏi kiến thức
+    if any(kw in query_lower for kw in ["how ", "what ", "when", "who", "search"]) or "?" in query_lower:
         return handle_knowledge_query_custom(query)
+    
+    # Kiểm tra tri thức đã học
     learned = get_learned_responses(query)
     if learned:
-        basic_data = random.choice(learned)
-        return generate_flexible_response(basic_data)
-    user_input = input(f"I don't know about '{query}'. Can you teach me? ").strip()
-    if user_input:
-        add_learned_responses(query, user_input)
-        return generate_flexible_response(user_input)
-    else:
-        return f"Sorry, I don't have any information about '{query}'."
+        return {"answer": generate_flexible_response(random.choice(learned)), "status": "success"}
+
+    # Nếu không có câu trả lời, thử tìm kiếm tri thức trước khi yêu cầu dạy
+    return handle_knowledge_query_custom(query)  # Thay vì yêu cầu dạy ngay, thử tìm kiếm
+
+
 
 def learn_new_knowledge(query: str) -> str:
     if "how to" in query.lower() or "what is" in query.lower():
@@ -1750,7 +2001,7 @@ def learn_new_knowledge(query: str) -> str:
 # -----------------------------------------------------------------------------
 # PHẦN KIỂM TRA THỜI TIẾT VÀ LỜI KHUYẾN
 # -----------------------------------------------------------------------------
-def get_weather(city_name: str, api_key: str) -> str:
+def get_weather(city_name: str, api_key: str, uid: str = None) -> str:
     base_url = "http://api.weatherapi.com/v1/current.json"
     params = {"key": api_key, "q": city_name}
     try:
@@ -1761,32 +2012,27 @@ def get_weather(city_name: str, api_key: str) -> str:
         weather_description = weather_data["current"]["condition"]["text"]
         humidity = weather_data["current"]["humidity"]
         wind_speed = weather_data["current"]["wind_kph"]
-        upcoming = get_upcoming_appointments(limit=1)
-        if any(keyword in weather_description.lower() for keyword in ["rain", "storm", "snow", "hail"]):
-            advice = "It looks like bad weather; if you go out, remember to bring an umbrella and warm clothes."
-        elif not upcoming:
-            advice = "The weather is beautiful and you have no appointments today. How about going out for a walk or exercise?"
-        else:
-            advice = "The weather is pleasant, but you have appointments scheduled."
+        advice = "Enjoy your day!"
+        if uid:
+            upcoming = get_upcoming_appointments(uid, limit=1)
+            if any(keyword in weather_description.lower() for keyword in ["rain", "storm", "snow", "hail"]):
+                advice = "It looks like bad weather; if you go out, remember to bring an umbrella and warm clothes."
+            elif not upcoming:
+                advice = "The weather is beautiful and you have no appointments today. How about going out for a walk or exercise?"
+            else:
+                advice = "The weather is pleasant, but you have appointments scheduled."
         return (f"Weather in {city_name}: {weather_description}, "
                 f"Temperature: {temperature}°C, Humidity: {humidity}%, "
                 f"Wind Speed: {wind_speed} km/h. {advice}")
     except requests.exceptions.HTTPError as e:
-        if response.status_code == 401:
-            return "Error: Invalid API Key."
-        elif response.status_code == 400:
-            return f"Error: City '{city_name}' not found."
-        else:
-            return f"Error fetching weather data: {e}"
-    except requests.exceptions.RequestException as e:
-        return f"Error fetching weather data: {e}"
+        return f"Error fetching weather data: {e.response.status_code}"
 
-def handle_check_weather(command: str, api_key: str) -> str:
+def handle_check_weather(command: str, api_key: str, uid: str = None) -> str:
     city_name = extract_location(command)
     if city_name:
         city_name = city_name.title()
         update_reward_score(1)
-        return get_weather(city_name, api_key)
+        return get_weather(city_name, api_key, uid)
     else:
         return "Please specify a city name."
 
@@ -1795,8 +2041,8 @@ WEATHERAPI_API_KEY = "5e65619e9ff54500a5c62422250103"
 # -----------------------------------------------------------------------------
 # PHẦN NHẮC LẠI LỊCH HẸN
 # -----------------------------------------------------------------------------
-def get_upcoming_appointments(limit=5) -> list:
-    service = authenticate_google_calendar()
+def get_upcoming_appointments(uid, limit=5):
+    service = authenticate_google_calendar(uid)
     now = datetime.utcnow().isoformat() + 'Z'
     events_result = service.events().list(calendarId='primary', timeMin=now,
                                           maxResults=limit, singleEvents=True,
@@ -1804,8 +2050,8 @@ def get_upcoming_appointments(limit=5) -> list:
     events = events_result.get('items', [])
     return events
 
-def check_appointment_reminders() -> str:
-    events = get_upcoming_appointments()
+def check_appointment_reminders(uid) -> str:
+    events = get_upcoming_appointments(uid)
     if events:
         reminders = "Upcoming appointments:\n"
         for event in events:
@@ -1825,31 +2071,31 @@ def personalize_response(response: str) -> str:
         return f"Hello {profile['username']}, {response}"
     return response
 
-def handle_set_username(command: str) -> str:
+def handle_set_username(command: str, uid: str = None) -> str:
     m = re.search(r"(?:set my name as|my name is)\s+(.*)", command, re.IGNORECASE)
     if m:
         username = m.group(1).strip()
-        update_user_profile(username=username)
+        update_user_profile(uid, username=username)  # Truyền uid vào
         update_reward_score(10)
         return f"Your name has been set to {username}."
     else:
         update_reward_score(-5)
         return "Could not extract your name. Please try again."
 
-def handle_set_location(command: str) -> str:
+def handle_set_location(command: str, uid: str = None) -> str:
     m = re.search(r"(?:set my location as|my location is)\s+(.*)", command, re.IGNORECASE)
     if m:
         location = m.group(1).strip()
-        update_user_profile(location=location)
+        update_user_profile(uid, location=location)  # Truyền uid vào
         update_reward_score(5)
         return f"Your location has been set to {location}."
     else:
         update_reward_score(-5)
         return "Could not extract your location. Please try again."
 
-def greet_user(uid, username=None, location=None) -> dict:
+def greet_user(uid=None , username=None, location=None) -> dict:
     """Trả về lời chào hoặc yêu cầu nhập thông tin nếu thiếu username hoặc location."""
-    profile = get_user_profile(uid)  # ✅ Truy vấn user theo UID
+    profile = get_user_profile(uid) or {} # ✅ Truy vấn user theo UID
 
     # Trường hợp 1: Nếu chưa có username
     if not profile or not profile.get("username"):
@@ -1866,7 +2112,7 @@ def greet_user(uid, username=None, location=None) -> dict:
 
     # Nếu đủ thông tin, trả về lời chào kèm thời tiết
     profile = get_user_profile(uid)  # ✅ Lấy profile sau khi cập nhật thông tin
-    weather_info = get_weather(profile["location"], WEATHERAPI_API_KEY)
+    weather_info = get_weather(profile["location"], WEATHERAPI_API_KEY,uid)
     score = profile["score"]
 
     return {"message": f"Hello {profile['username']}! Your current reward score is {score}. {weather_info}"}
@@ -1947,7 +2193,7 @@ if __name__ == "__main__":
         # Nếu người dùng gửi phản hồi tiêu cực
         if user_input.lower().startswith("feedback:"):
             feedback_text = user_input[len("feedback:"):].strip()
-            feedback_response = process_negative_feedback(feedback_text)
+            feedback_response = process_negative_feedback(original_query, feedback_text)
             print("\n" + feedback_response)
             continue
 
